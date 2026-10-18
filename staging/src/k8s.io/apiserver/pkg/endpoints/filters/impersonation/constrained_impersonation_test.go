@@ -17,14 +17,17 @@ limitations under the License.
 package impersonation
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +49,7 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/transport"
+	"k8s.io/klog/v2"
 )
 
 type constrainedImpersonationTest struct {
@@ -2403,4 +2407,110 @@ func doImpersonationRequest(tb testing.TB, baseTransport http.RoundTripper, url 
 	require.Equal(tb, expectedCode, resp.StatusCode)
 
 	return resp
+}
+
+func TestConstrainedImpersonationAuthorizationLogging(t *testing.T) {
+	saOnNode1 := &user.DefaultInfo{
+		Name:   "system:serviceaccount:default:default",
+		Groups: []string{"associate-node-impersonater"},
+		Extra: map[string][]string{
+			serviceaccount.NodeNameKey: {"node1"},
+		},
+	}
+	getPod := authorizer.AttributesRecord{
+		User:            saOnNode1,
+		Verb:            "get",
+		Namespace:       "bar",
+		APIVersion:      "v1",
+		Resource:        "pods",
+		Name:            "foo",
+		ResourceRequest: true,
+	}
+
+	testCases := []struct {
+		name         string
+		verbosity    string
+		authorizer   authorizer.AuthorizerFunc
+		expectedErr  string
+		expectedLogs []string
+	}{
+		{
+			// the associated-node mode wraps the attributes to rewrite the name and drop extra values,
+			// so the log must reflect what the authorizer saw instead of the raw request attributes
+			name:      "associated node allowed logs wrapped attributes",
+			verbosity: "5",
+			authorizer: func(_ context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+				switch a.GetVerb() {
+				case "impersonate-on:associated-node:get", "impersonate:associated-node":
+					return authorizer.DecisionAllow, "allowed by test", nil
+				}
+				return authorizer.DecisionNoOpinion, "", nil
+			},
+			expectedLogs: []string{
+				`"Impersonation authorization check" username="system:serviceaccount:default:default" uid="" groups=["associate-node-impersonater"] extra={"authentication.kubernetes.io/associated-node-keys":["authentication.kubernetes.io/node-name"]} isResourceRequest=true namespace="bar" verb="impersonate-on:associated-node:get" group="" version="v1" resource="pods" subresource="" name="foo" fieldSelector=null labelSelector="" path="" decision="Allow" reason="allowed by test" err=null`,
+				`"Impersonation authorization check" username="system:serviceaccount:default:default" uid="" groups=["associate-node-impersonater"] extra={"authentication.kubernetes.io/associated-node-keys":["authentication.kubernetes.io/node-name"]} isResourceRequest=true namespace="" verb="impersonate:associated-node" group="authentication.k8s.io" version="v1" resource="nodes" subresource="" name="*" fieldSelector=null labelSelector="" path="" decision="Allow" reason="allowed by test" err=null`,
+			},
+		},
+		{
+			name:      "denied logs reason and error for every mode attempted",
+			verbosity: "5",
+			authorizer: func(_ context.Context, _ authorizer.Attributes) (authorizer.Decision, string, error) {
+				return authorizer.DecisionDeny, "denied by test", errors.New("authorizer failed")
+			},
+			expectedErr: `pods "foo" is forbidden: User "system:serviceaccount:default:default" cannot impersonate-on:associated-node:get resource "pods" in API group "" in the namespace "bar": authorizer failed: denied by test`,
+			expectedLogs: []string{
+				`"Impersonation authorization check" username="system:serviceaccount:default:default" uid="" groups=["associate-node-impersonater"] extra={"authentication.kubernetes.io/associated-node-keys":["authentication.kubernetes.io/node-name"]} isResourceRequest=true namespace="bar" verb="impersonate-on:associated-node:get" group="" version="v1" resource="pods" subresource="" name="foo" fieldSelector=null labelSelector="" path="" decision="Deny" reason="denied by test" err="authorizer failed"`,
+				`"Impersonation authorization check" username="system:serviceaccount:default:default" uid="" groups=["associate-node-impersonater"] extra={"authentication.kubernetes.io/node-name":["node1"]} isResourceRequest=true namespace="bar" verb="impersonate-on:arbitrary-node:get" group="" version="v1" resource="pods" subresource="" name="foo" fieldSelector=null labelSelector="" path="" decision="Deny" reason="denied by test" err="authorizer failed"`,
+				`"Impersonation authorization check" username="system:serviceaccount:default:default" uid="" groups=["associate-node-impersonater"] extra={"authentication.kubernetes.io/node-name":["node1"]} isResourceRequest=true namespace="" verb="impersonate" group="" version="v1" resource="users" subresource="" name="system:node:node1" fieldSelector=null labelSelector="" path="" decision="Deny" reason="denied by test" err="authorizer failed"`,
+			},
+		},
+		{
+			name:      "nothing logged below verbosity 5",
+			verbosity: "4",
+			authorizer: func(_ context.Context, _ authorizer.Attributes) (authorizer.Decision, string, error) {
+				return authorizer.DecisionDeny, "denied by test", nil
+			},
+			expectedErr:  `pods "foo" is forbidden: User "system:serviceaccount:default:default" cannot impersonate-on:associated-node:get resource "pods" in API group "" in the namespace "bar": denied by test`,
+			expectedLogs: nil,
+		},
+	}
+
+	// strip the timestamp and pid but keep the file name to assert that the log depth points at the caller in mode.go
+	headerRE := regexp.MustCompile(`(?m)^I\d{4} \S+\s+\d+ (\w+\.go):\d+\] `)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// klog is global state, so these subtests must not run in parallel
+			state := klog.CaptureState()
+			t.Cleanup(state.Restore)
+
+			var level klog.Level
+			require.NoError(t, level.Set(tc.verbosity))
+			var buf bytes.Buffer
+			klog.LogToStderr(false)
+			klog.SetOutput(&buf)
+
+			tracker := newImpersonationModesTracker(tc.authorizer)
+			impersonatedUser, err := tracker.getImpersonatedUser(context.Background(), &user.DefaultInfo{Name: "system:node:node1"}, getPod)
+			if len(tc.expectedErr) == 0 {
+				require.NoError(t, err)
+				require.Equal(t, "system:node:node1", impersonatedUser.user.GetName())
+			} else {
+				require.EqualError(t, err, tc.expectedErr)
+			}
+
+			klog.Flush()
+			var actualLogs []string
+			for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				if len(line) == 0 {
+					continue
+				}
+				m := headerRE.FindStringSubmatch(line)
+				require.NotNil(t, m, "unexpected log line format: %q", line)
+				require.Equal(t, "mode.go", m[1], "log depth should point at the authorization caller: %q", line)
+				actualLogs = append(actualLogs, strings.TrimPrefix(line, m[0]))
+			}
+			require.Equal(t, tc.expectedLogs, actualLogs)
+		})
+	}
 }
